@@ -1,0 +1,109 @@
+name: Hotfix Tag and Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  hotfix-tag-and-release:
+    if: >
+      github.event.pull_request.merged == true &&
+      (
+        startsWith(github.event.pull_request.head.ref, 'hotfix/') ||
+        startsWith(github.event.pull_request.head.ref, 'bugfix/') ||
+        startsWith(github.event.pull_request.head.ref, 'fix/')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write   # lets this job request a GitHub OIDC token for the release-notes step
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Determine next patch version
+        id: version
+        run: |
+          LATEST=$(git tag --list 'v*' --sort=-version:refname | head -n 1)
+          if [ -z "$LATEST" ]; then
+            echo "No versioned release tag found on main. A full release must be cut before hotfixes can be versioned. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          MAJOR_MINOR=$(echo "$LATEST" | sed -E 's/^v([0-9]+\.[0-9]+)\.[0-9]+$/\1/')
+          PATCH=$(echo "$LATEST" | sed -E 's/^v[0-9]+\.[0-9]+\.([0-9]+)$/\1/')
+          NEXT_PATCH=$((PATCH + 1))
+          echo "version=v${MAJOR_MINOR}.${NEXT_PATCH}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag and generate release notes
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          gh release create "${{ steps.version.outputs.version }}" \
+            --target main \
+            --generate-notes \
+            --title "${{ steps.version.outputs.version }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate release notes draft
+        if: steps.version.outputs.skip != 'true'
+        continue-on-error: true
+        run: node apps/api/scripts/generate-release-notes.mjs
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NEW_VERSION: ${{ steps.version.outputs.version }}
+          MAIN_REPO_PATH: ${{ github.workspace }}
+          API_UPSTREAM_URL: ${{ vars.API_UPSTREAM_URL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+
+      - name: Checkout staging for merge-back
+        if: steps.version.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: staging
+          fetch-depth: 0
+
+      - name: Create merge-back branch
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          git config user.name "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git checkout -b "merge-back/${{ steps.version.outputs.version }}"
+
+      - name: Merge fix branch into staging
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          # Use head.sha so this works even if GitHub auto-deleted the hotfix branch.
+          git fetch origin "${{ github.event.pull_request.head.sha }}"
+
+          git merge --no-ff FETCH_HEAD \
+            -m "Merge ${{ github.event.pull_request.head.ref }} into staging"
+
+      - name: Push merge-back branch and open PR
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          git push --force origin "HEAD:merge-back/${{ steps.version.outputs.version }}"
+
+          ASSIGNEE="${{ github.event.pull_request.merged_by.login }}"
+          ASSIGNEE_ARG=""
+          if [ -n "$ASSIGNEE" ]; then
+            ASSIGNEE_ARG="--assignee $ASSIGNEE"
+          fi
+
+          gh pr create \
+            --base staging \
+            --head "merge-back/${{ steps.version.outputs.version }}" \
+            --title "Merge ${{ github.event.pull_request.head.ref }} into staging" \
+            --body "Automated merge-back after ${{ steps.version.outputs.version }} shipped." \
+            $ASSIGNEE_ARG
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
