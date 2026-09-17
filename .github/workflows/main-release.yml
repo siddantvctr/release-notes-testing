@@ -1,4 +1,4 @@
-name: Hotfix Tag and Release
+name: Tag and Release
 
 on:
   pull_request:
@@ -6,14 +6,10 @@ on:
     branches: [main]
 
 jobs:
-  hotfix-tag-and-release:
+  tag-and-release:
     if: >
       github.event.pull_request.merged == true &&
-      (
-        startsWith(github.event.pull_request.head.ref, 'hotfix/') ||
-        startsWith(github.event.pull_request.head.ref, 'bugfix/') ||
-        startsWith(github.event.pull_request.head.ref, 'fix/')
-      )
+      startsWith(github.event.pull_request.head.ref, 'release/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -27,23 +23,14 @@ jobs:
           fetch-depth: 0
           ref: main
 
-      - name: Determine next patch version
+      - name: Extract version from branch name
         id: version
         run: |
-          LATEST=$(git tag --list 'v*' --sort=-version:refname | head -n 1)
-          if [ -z "$LATEST" ]; then
-            echo "No versioned release tag found on main. A full release must be cut before hotfixes can be versioned. Skipping."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          MAJOR_MINOR=$(echo "$LATEST" | sed -E 's/^v([0-9]+\.[0-9]+)\.[0-9]+$/\1/')
-          PATCH=$(echo "$LATEST" | sed -E 's/^v[0-9]+\.[0-9]+\.([0-9]+)$/\1/')
-          NEXT_PATCH=$((PATCH + 1))
-          echo "version=v${MAJOR_MINOR}.${NEXT_PATCH}" >> "$GITHUB_OUTPUT"
-          echo "skip=false" >> "$GITHUB_OUTPUT"
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          VERSION="v${BRANCH#release/}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Create tag and generate release notes
-        if: steps.version.outputs.skip != 'true'
+      - name: Create tag and GitHub release
         run: |
           gh release create "${{ steps.version.outputs.version }}" \
             --target main \
@@ -53,7 +40,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate release notes draft
-        if: steps.version.outputs.skip != 'true'
         continue-on-error: true
         run: node .github/workflows/files/generate-release-notes.mjs
         env:
@@ -63,7 +49,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Gemini summary
-        if: steps.version.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: gemini-summary
@@ -74,30 +59,26 @@ jobs:
       # commented out (not removed) for this test run.
 
       # - name: Checkout staging for merge-back
-      #   if: steps.version.outputs.skip != 'true'
       #   uses: actions/checkout@v4
       #   with:
       #     ref: staging
       #     fetch-depth: 0
       #
       # - name: Create merge-back branch
-      #   if: steps.version.outputs.skip != 'true'
       #   run: |
       #     git config user.name "release-bot"
       #     git config user.email "release-bot@users.noreply.github.com"
       #     git checkout -b "merge-back/${{ steps.version.outputs.version }}"
       #
-      # - name: Merge fix branch into staging
-      #   if: steps.version.outputs.skip != 'true'
+      # - name: Merge release branch into staging
       #   run: |
-      #     # Use head.sha so this works even if GitHub auto-deleted the hotfix branch.
+      #     # Use head.sha so this works even if GitHub auto-deleted the release branch.
       #     git fetch origin "${{ github.event.pull_request.head.sha }}"
       #
       #     git merge --no-ff FETCH_HEAD \
       #       -m "Merge ${{ github.event.pull_request.head.ref }} into staging"
       #
       # - name: Push merge-back branch and open PR
-      #   if: steps.version.outputs.skip != 'true'
       #   run: |
       #     git push --force origin "HEAD:merge-back/${{ steps.version.outputs.version }}"
       #
@@ -110,8 +91,15 @@ jobs:
       #     gh pr create \
       #       --base staging \
       #       --head "merge-back/${{ steps.version.outputs.version }}" \
-      #       --title "Merge ${{ github.event.pull_request.head.ref }} into staging" \
-      #       --body "Automated merge-back after ${{ steps.version.outputs.version }} shipped." \
+      #       --title "Merge release/${{ steps.version.outputs.version }} into staging" \
+      #       --body "Automated gitflow merge-back after ${{ steps.version.outputs.version }} shipped." \
       #       $ASSIGNEE_ARG
+      #   env:
+      #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #
+      # - name: Clean up merge-back branch on failure
+      #   if: failure()
+      #   run: |
+      #     git push origin --delete "merge-back/${{ steps.version.outputs.version }}" || true
       #   env:
       #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
